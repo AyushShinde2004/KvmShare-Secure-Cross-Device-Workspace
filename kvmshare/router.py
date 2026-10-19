@@ -413,6 +413,8 @@ class Router:
                 self._hk_swallow.discard(vk)
                 return True
             return False
+        if vk in self._hk_swallow:           # auto-repeat of a held hotkey: swallow, never re-trigger
+            return True
         for hk, action in ((self.reclaim_hk, self.reclaim), (self.clip_hk, self._clip_hotkey),
                            (self.split_hk, self._split_hotkey)):
             if hk and vk == hk[1] and hk[0] <= self.mods:

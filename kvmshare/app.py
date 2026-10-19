@@ -136,6 +136,10 @@ class Daemon:
 
     # ---- split mode: both computers independent (no pointer/keyboard forwarding) ----
     def toggle_split(self):
+        now = time.monotonic()
+        if now - getattr(self, "_split_t", 0) < 0.8:        # debounce: one physical press = one toggle
+            return
+        self._split_t = now
         self.set_split(self.router.input_enabled)               # enabled -> go split; split -> rejoin
 
     def set_split(self, on: bool):

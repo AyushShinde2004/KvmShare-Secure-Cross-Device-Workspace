@@ -43,6 +43,7 @@ DEFAULTS = {
         "forward_injected_keys": False,
         "reclaim_hotkey": "ctrl+alt+shift+f12",
         "clipboard_pause_hotkey": "ctrl+alt+shift+f11",
+        "split_hotkey": "ctrl+alt+shift+f10",   # toggle: both computers fully independent <-> shared pointer
         "max_delta": 4000,
     },
     "clipboard": {
