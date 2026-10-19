@@ -1,0 +1,10 @@
+[project]
+name = "kvmshare"
+version = "1.0.0"
+requires-python = ">=3.10"
+dependencies = ["cryptography>=42", "spake2>=0.9", "psutil>=5.9"]
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+[tool.setuptools]
+packages = ["kvmshare"]
