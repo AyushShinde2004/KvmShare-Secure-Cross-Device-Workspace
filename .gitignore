@@ -1,12 +1,45 @@
 __pycache__/
 *.py[cod]
+*$py.class
 *.egg-info/
 .pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.tox/
+.nox/
+.coverage
+.coverage.*
+htmlcov/
 .venv/
 venv/
+env/
 build/
 dist/
+*.log
+
+# Editors and operating system files
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
 
 # Local runtime configuration and secrets
 .env
+.env.*
+!.env.example
 *.local
+*.local.json
+config.json
+credentials.json
+secrets.json
+*.token
+*.pem
+*.key
+*.crt
+*.cer
+*.p12
+*.pfx
+id_rsa
+id_ed25519
