@@ -58,6 +58,16 @@ class Control:
             elif name == "files": d.files.enabled = on
             else: raise ValueError("unknown feature")
             return "ok"
+        if cmd == "corner":
+            if a.get("value") is not None:
+                d.router.set_corner_dead(int(a["value"]))
+            return d.router.icfg["corner_dead_px"]
+        if cmd == "speed":
+            if a.get("value") is not None:
+                d.router.set_speed(float(a["value"]))
+            return d.router.icfg["pointer_speed"]
+        if cmd == "cleanup":
+            return await asyncio.get_running_loop().run_in_executor(None, d.files.cleanup_once)
         if cmd == "transfers":
             return d.files.list()
         if cmd == "accept":

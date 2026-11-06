@@ -45,6 +45,8 @@ DEFAULTS = {
         "clipboard_pause_hotkey": "ctrl+alt+shift+f11",
         "split_hotkey": "ctrl+alt+shift+f10",   # toggle: both computers fully independent <-> shared pointer
         "max_delta": 4000,
+        "corner_dead_px": 32,          # top/bottom N px of a shared edge never switch screens (0 = whole edge switches)
+        "max_forward_delta": 1500,     # a single mouse event larger than this is treated as an artefact
     },
     "clipboard": {
         "formats": ["text", "html", "rtf", "image"],
@@ -61,7 +63,9 @@ DEFAULTS = {
         "max_total_gb": 500,
         "offer_ttl_s": 3600,
         "put_on_clipboard": True,
+        "cleanup_minutes": 60,         # delete received batches this long after they stop being active (0 = never)
     },
+    "notifications": {"enabled": True, "sound": False},   # toasts for transfers/split mode; "sound": true restores the chime
     "metrics": {"stamp_moves": False},
     "log_level": "INFO",
 }

@@ -109,6 +109,24 @@ def cmd_revoke(a):
         pass
 
 
+def cmd_speed(a):
+    if a.value is None:
+        print("pointer_speed =", _call("speed"))
+        return
+    v = max(0.2, min(4.0, a.value))
+    C.save_user_config({"input": {"pointer_speed": v}})
+    print("pointer_speed =", _call("speed", value=v), "(saved)")
+
+
+def cmd_corner(a):
+    if a.pixels is None:
+        print("corner_dead_px =", _call("corner"))
+        return
+    v = max(0, min(400, a.pixels))
+    C.save_user_config({"input": {"corner_dead_px": v}})
+    print("corner_dead_px =", _call("corner", value=v), "(saved)")
+
+
 def cmd_bench(a):
     if a.kind == "net":
         r = _call("bench_net", count=a.count, rate=a.rate)
@@ -140,6 +158,14 @@ def main(argv=None):
     q = sp.add_parser("feature", help="enable/disable input, clipboard or files at runtime")
     q.add_argument("name", choices=["input", "clipboard", "files"]); q.add_argument("state", choices=["on", "off"])
     q.set_defaults(f=lambda a: _call("feature", name=a.name, on=a.state == "on"))
+    q = sp.add_parser("speed", help="pointer speed for motion this computer forwards to the other (live, saved)")
+    q.add_argument("value", type=float, nargs="?", help="e.g. 1.3 (0.2-4.0). Omit to show the current value")
+    q.set_defaults(f=cmd_speed)
+    sp.add_parser("cleanup", help="delete expired received files now").set_defaults(
+        f=lambda a: print("removed:", _call("cleanup") or "nothing due"))
+    q = sp.add_parser("corner", help="size of the no-switch zone at the top/bottom corners of shared edges (0 = off)")
+    q.add_argument("pixels", type=int, nargs="?", help="e.g. 48. Omit to show the current value")
+    q.set_defaults(f=cmd_corner)
     sp.add_parser("transfers").set_defaults(f=lambda a: _show(_call("transfers")))
     q = sp.add_parser("accept"); q.add_argument("id"); q.set_defaults(f=lambda a: print(_call("accept", id=a.id)))
     q = sp.add_parser("cancel"); q.add_argument("id"); q.set_defaults(f=lambda a: print(_call("cancel", id=a.id)))

@@ -138,6 +138,7 @@ class Router:
         self._expect_t = 0.0
         self._rem = [0.0, 0.0]
         self._last_d = (0, 0)
+        self._n = 0
         self._force = None            # set by split-mode resume: explicit owner chosen by the user
         self._force_epoch = 0
 
@@ -181,7 +182,8 @@ class Router:
 
     def _resolve(self):
         try:
-            self.resolved = topo.resolve(self.cfg["topology"], self.layouts, self.icfg["entry_inset_px"])
+            self.resolved = topo.resolve(self.cfg["topology"], self.layouts, self.icfg["entry_inset_px"],
+                                         int(self.icfg.get("corner_dead_px", 0)))
             self.topology_error = None
             self.topology_warnings = self.resolved.warnings()
             for w in self.topology_warnings:
@@ -316,13 +318,22 @@ class Router:
 
     def _local_move(self, x: int, y: int, now: float) -> bool:
         prev, self.pos = self.pos, (x, y)
-        dx, dy = x - prev[0], y - prev[1]
+        # Direction of THIS event. The LL hook runs before Windows moves the cursor, so (reported point -
+        # actual cursor) is the true motion even when the cursor is clamped against a screen edge or
+        # corner, where the reported point lies beyond the screen. Comparing with the previous *reported*
+        # point is wrong there: two overshooting points can differ in the "wrong" direction, and a push
+        # into a corner then never counted as a push towards the other computer.
+        try:
+            cx, cy = self.platform.cursor_pos()
+            dx, dy = x - cx, y - cy
+        except Exception:                                    # noqa: BLE001
+            dx = dy = 0
+        if not (dx or dy):
+            dx, dy = x - prev[0], y - prev[1]
         if dx or dy:
             self._last_d = (dx, dy)
         else:
-            # Pointer is clamped at a screen edge and the hook repeats the position: the user is
-            # still pushing, so keep the last direction of travel (otherwise an edge arrival that
-            # was ignored once could never trigger again).
+            # Hook repeated the clamped position: the user is still pushing in the last direction.
             dx, dy = self._last_d
         if not self._active() or self.resolved is None or (dx == 0 and dy == 0):
             return False
@@ -345,6 +356,23 @@ class Router:
         self.park = self.platform.begin_capture()
         self.metrics.count("handoff_out")
 
+    def set_corner_dead(self, px: int) -> int:
+        """Live size (in pixels) of the no-switch zone at both ends of every shared edge."""
+        v = max(0, min(400, int(px)))
+        with self.lock:
+            self.icfg["corner_dead_px"] = v
+            if self.resolved is not None:
+                self.resolved.corner_dead = v
+        return v
+
+    def set_speed(self, value: float) -> float:
+        """Live pointer-speed multiplier for motion THIS machine forwards to the peer."""
+        v = max(0.2, min(4.0, float(value)))
+        with self.lock:
+            self.icfg["pointer_speed"] = v
+            self._rem = [0.0, 0.0]
+        return v
+
     def _scale(self, dx: int, dy: int) -> Tuple[int, int]:
         s = float(self.icfg.get("pointer_speed", 1.0))
         if s == 1.0:
@@ -355,7 +383,14 @@ class Router:
         return ix, iy
 
     def _fwd_move(self, x: int, y: int) -> bool:
+        ready = getattr(self.platform, "capture_ready", None)
+        if ready is not None and not ready():        # cursor not parked yet: deltas would be garbage
+            return True
         dx, dy = x - self.park[0], y - self.park[1]
+        lim = int(self.icfg.get("max_forward_delta", 1500))
+        if abs(dx) > lim or abs(dy) > lim:           # not human motion: a re-park / echo artefact, never forward it
+            self.metrics.count("forward_delta_rejected")
+            return True
         if dx or dy:
             dx, dy = self._scale(dx, dy)
             if dx or dy:
@@ -492,12 +527,16 @@ class Router:
             if not self._accept(epoch):
                 self.metrics.count("stale_input_dropped")
                 return
-            t0 = time.perf_counter_ns()
-            self._apply_move(self._limit(dx), self._limit(dy))
-            t1 = time.perf_counter_ns()
-            self.metrics.observe("inject_us", (t1 - t0) / 1000)
-            if ts_ns:
-                self.metrics.observe("move_oneway_ms", (t1 - (ts_ns - offset_ns)) / 1e6)
+            self._n += 1
+            if ts_ns or (self._n & 31) == 0:               # measure, but don't tax every single event
+                t0 = time.perf_counter_ns()
+                self._apply_move(self._limit(dx), self._limit(dy))
+                t1 = time.perf_counter_ns()
+                self.metrics.observe("inject_us", (t1 - t0) / 1000)
+                if ts_ns:
+                    self.metrics.observe("move_oneway_ms", (t1 - (ts_ns - offset_ns)) / 1e6)
+            else:
+                self._apply_move(self._limit(dx), self._limit(dy))
 
     def _apply_move(self, dx: int, dy: int):
         pos = self.pos
@@ -552,12 +591,12 @@ class Router:
             self._release_injected()
             self.keys.drop_forwarded()
             self.fwd_buttons.clear()
-            self.platform.end_capture()
             if self.resolved and not self.resolved.inside(self.machine, x, y):
                 x, y = self.resolved.clamp(self.machine, self.pos, (x, y))
             self.last_switch = time.monotonic()
             self._expect, self._expect_t, self.pos = (x, y), self.last_switch, (x, y)
-            self.platform.move_abs(x, y)
+            self.platform.move_abs(x, y)             # move to the entry point first...
+            self.platform.end_capture()              # ...then drop the overlay: never visible at the old spot
             self.metrics.count("handoff_in")
 
     def on_claim(self, epoch: int):

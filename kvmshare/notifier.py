@@ -7,6 +7,10 @@ log = logging.getLogger("kvmshare.notify")
 _PS = r"""
 [Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType = WindowsRuntime] | Out-Null
 $t = [Windows.UI.Notifications.ToastNotificationManager]::GetTemplateContent([Windows.UI.Notifications.ToastTemplateType]::ToastText02)
+if ($env:KVM_SILENT -eq '1') {
+  $audio = $t.CreateElement('audio'); $audio.SetAttribute('silent', 'true')
+  $t.DocumentElement.AppendChild($audio) | Out-Null
+}
 $n = $t.GetElementsByTagName('text')
 $n.Item(0).AppendChild($t.CreateTextNode($env:KVM_T)) | Out-Null
 $n.Item(1).AppendChild($t.CreateTextNode($env:KVM_B)) | Out-Null
@@ -14,14 +18,21 @@ $n.Item(1).AppendChild($t.CreateTextNode($env:KVM_B)) | Out-Null
 """
 
 
+SETTINGS = {"enabled": True, "sound": False}
+
+
+def configure(settings: dict):
+    SETTINGS.update({k: bool(v) for k, v in (settings or {}).items() if k in SETTINGS})
+
+
 def notify(title: str, body: str):
     """Toast on Windows (text passed via environment: no script injection); log elsewhere.
     Never called with clipboard contents."""
     log.info("notify: %s - %s", title, body)
-    if sys.platform != "win32":
+    if sys.platform != "win32" or not SETTINGS["enabled"]:
         return
     try:
-        env = dict(os.environ, KVM_T=title[:100], KVM_B=body[:300])
+        env = dict(os.environ, KVM_T=title[:100], KVM_B=body[:300], KVM_SILENT="0" if SETTINGS["sound"] else "1")
         subprocess.Popen(["powershell", "-NoProfile", "-NonInteractive", "-WindowStyle", "Hidden", "-Command", _PS],
                          env=env, creationflags=0x08000000, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     except OSError:

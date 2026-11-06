@@ -143,7 +143,8 @@ class Resolved:
 
     def __init__(self, screens: Dict[str, Tuple[str, Monitor]],
                  machine_monitors: Dict[str, List[Monitor]],
-                 links: List[Link], inset: int = 1):
+                 links: List[Link], inset: int = 1, corner_dead: int = 0):
+        self.corner_dead = max(0, int(corner_dead))   # px at both ends of a managed edge that never switch
         self.screens = screens                    # id -> (machine, Monitor)
         self.machine_monitors = machine_monitors  # machine -> all monitors
         self.links = links
@@ -220,6 +221,12 @@ class Resolved:
             return None
         link, dst, dst_side = hit
         vertical = side in ("left", "right")
+        if self.corner_dead:
+            sr = self.screens[src][1].rect
+            lo, length = (sr.top, sr.h) if vertical else (sr.left, sr.w)
+            t = min(max(along - lo, 0), length - 1)
+            if t < self.corner_dead or t > length - 1 - self.corner_dead:
+                return None                       # corner: like plain Windows, the pointer just stops here
         v = self._map_along(link, src, dst, along, vertical)
         d_mach, d_mon = self.screens[dst]
         r, k = d_mon.rect, self.inset
@@ -329,7 +336,7 @@ def clamp_to_union(monitors: List[Monitor], q: Tuple[int, int]) -> Tuple[int, in
     return best
 
 
-def resolve(cfg: dict, machines: Dict[str, List[Monitor]], inset: int = 1) -> Resolved:
+def resolve(cfg: dict, machines: Dict[str, List[Monitor]], inset: int = 1, corner_dead: int = 0) -> Resolved:
     """Bind a topology config to detected monitors of every machine."""
     specs = cfg.get("screens") or []
     order = cfg.get("order") or [s["id"] for s in specs]
@@ -360,7 +367,7 @@ def resolve(cfg: dict, machines: Dict[str, List[Monitor]], inset: int = 1) -> Re
     else:
         for a, b in zip(order, order[1:]):
             links.append(Link(a, "right", b, "left"))
-    return Resolved(screens, {m: list(v) for m, v in machines.items()}, links, inset)
+    return Resolved(screens, {m: list(v) for m, v in machines.items()}, links, inset, corner_dead)
 
 
 DEFAULT_TOPOLOGY = {

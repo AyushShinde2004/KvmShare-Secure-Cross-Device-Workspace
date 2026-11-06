@@ -15,13 +15,14 @@ from __future__ import annotations
 import ctypes
 import logging
 import threading
+import time
 from typing import Callable, List, Optional, Tuple
 
 from . import win32 as W
 from .topology import Monitor
 
 log = logging.getLogger("kvmshare.winio")
-CMD_SHOW, CMD_HIDE, CMD_LAYOUT = 1, 2, 3
+CMD_SHOW, CMD_HIDE, CMD_LAYOUT, CMD_PARK = 1, 2, 3, 4
 HC_ACTION = 0
 WM_KEYDOWN_FAMILY = (0x100, 0x101, 0x104, 0x105)
 
@@ -31,6 +32,8 @@ class WinPlatform:
         self.cfg, self.icfg = cfg, cfg["input"]
         self.router = None
         self.injecting = 0
+        self._inj_lock = threading.Lock()   # `injecting` is touched by several threads: += is NOT atomic
+        self._last_inj = None               # (x, y, t) of our last SetCursorPos: recognises its echo exactly
         self.tid = 0
         self.hwnd = self.overlay = None
         self.ready = threading.Event()
@@ -42,6 +45,11 @@ class WinPlatform:
         self._bench: Optional[Tuple[threading.Event, list]] = None
         # Enumerate now: the daemon reads monitors() BEFORE start(), an empty list means no topology
         self._mons: List[Monitor] = W.enum_monitors()
+        self._park = (0, 0)
+        self._center = (0, 0)
+        self._capturing = False
+        self._gen = 0                       # capture generation: stale queued commands are discarded
+        self._capture_pending = False      # True between a cross-thread begin_capture and the parking
 
     # ------------------------------------------------------------ lifecycle
     def start(self, router):
@@ -70,6 +78,8 @@ class WinPlatform:
 
     # --------------------------------------------------------- input thread
     def _main(self):
+        from . import perf
+        perf.boost_thread(15)                      # the hook thread must never wait behind other apps
         self.tid = W.kernel32.GetCurrentThreadId()
         hinst = W.kernel32.GetModuleHandleW(None)
         self._wndproc = W.WNDPROC(self._on_wnd)
@@ -104,6 +114,10 @@ class WinPlatform:
             try:
                 i = W.MSLLHOOKSTRUCT.from_address(lp)
                 ours = self.injecting > 0 or i.dwExtraInfo == W.MARKER
+                if not ours and wp == 0x200:
+                    li = self._last_inj
+                    # the echo of our own SetCursorPos: same pixel, a few ms ago (never trust the counter alone)
+                    ours = li is not None and li[0] == i.pt.x and li[1] == i.pt.y and time.monotonic() - li[2] < 0.1
                 if self._bench and ours and wp == 0x200:
                     self._bench[1].append((i.pt.x, i.pt.y, __import__("time").perf_counter_ns()))
                     self._bench[0].set()
@@ -131,7 +145,11 @@ class WinPlatform:
                     W.user32.SetCursor(None)
                     return 1
             elif msg == W.WM_APP:
-                self._cmd(int(wp))
+                self._cmd(int(wp), int(lp))
+                return 0
+            elif msg == W.WM_TIMER and wp == 2:
+                W.user32.KillTimer(self.hwnd, 2)
+                self._recenter_hidden()
                 return 0
             elif msg == W.WM_TIMER:
                 self.router.on_tick()
@@ -156,14 +174,88 @@ class WinPlatform:
             log.exception("wndproc")
         return W.user32.DefWindowProcW(hwnd, msg, wp, lp)
 
-    def _cmd(self, c: int):
-        if c == CMD_SHOW:
+    def _show_overlay(self):
+        vx, vy = W.user32.GetSystemMetrics(W.SM_XVIRTUALSCREEN), W.user32.GetSystemMetrics(W.SM_YVIRTUALSCREEN)
+        vw, vh = W.user32.GetSystemMetrics(W.SM_CXVIRTUALSCREEN), W.user32.GetSystemMetrics(W.SM_CYVIRTUALSCREEN)
+        # HWND_TOPMOST=-1, SWP_NOACTIVATE|SWP_SHOWWINDOW
+        W.user32.SetWindowPos(self.overlay, ctypes.c_void_p(-1), vx, vy, vw, vh, 0x10 | 0x40)
+
+    def _set_router_park(self, p):
+        r = self.router
+        if r is not None and r.lock.acquire(timeout=0.05):
+            try:
+                r.park = p
+            finally:
+                r.lock.release()
+
+    def _router_forwarding(self) -> bool:
+        r = self.router
+        if r is None or not r.lock.acquire(timeout=0.2):
+            return True                               # cannot tell: rely on the generation check
+        try:
+            return r._forwarding()
+        finally:
+            r.lock.release()
+
+    def _capture_now(self, gen: int):
+        """Input thread only. The pointer has just left this machine.
+
+        Two-step on purpose. Windows decides which window owns the cursor image lazily, so blanking the
+        cursor and *also* teleporting it to the centre in the same instant leaves it visible at the centre
+        for a few milliseconds (the flash). Instead: (1) show the overlay and blank the cursor where it
+        already is (the screen edge), (2) ~40 ms later, once the overlay owns the cursor, move it to the
+        centre. The re-centre is then invisible.
+
+        `gen` guards rapid back-and-forth crossings: a request queued by an earlier crossing must never
+        act after the pointer has already come back (that made the cursor jump to the screen centre)."""
+        if gen != self._gen or not self._router_forwarding():
+            return
+        self._capturing = True
+        if self.icfg.get("hide_cursor", True):
+            self._park = self.cursor_pos()           # interim park = where the pointer is right now
+            self._set_router_park(self._park)
+            self._show_overlay()
+            W.user32.SetCursor(None)
+            W.user32.SetTimer(self.hwnd, 2, 40, None)
+        else:
+            self._park = self._center
+            self._set_router_park(self._center)
+            self.move_abs(*self._center)
+        self._capture_pending = False
+
+    def _recenter_hidden(self):
+        r = self.router
+        if not self._capturing or r is None:          # pointer already came back
+            return
+        if not r.lock.acquire(timeout=0.05):          # router busy: retry shortly, never leave park inconsistent
+            W.user32.SetTimer(self.hwnd, 2, 15, None)
+            return
+        try:
+            if not r._forwarding():                   # we own the pointer again: do NOT touch the cursor
+                self._capturing = False
+                return
+            W.user32.SetCursor(None)
+            self._park = self._center
+            r.park = self._center                     # park FIRST: the echo of the move below must read as "no motion"
+            self.move_abs(*self._center)
+        finally:
+            r.lock.release()
+
+    def _cmd(self, c: int, gen: int = 0):
+        if c == CMD_PARK:
+            self._capture_now(gen)
+        elif c == CMD_SHOW:
             vx, vy = W.user32.GetSystemMetrics(W.SM_XVIRTUALSCREEN), W.user32.GetSystemMetrics(W.SM_YVIRTUALSCREEN)
             vw, vh = W.user32.GetSystemMetrics(W.SM_CXVIRTUALSCREEN), W.user32.GetSystemMetrics(W.SM_CYVIRTUALSCREEN)
             # HWND_TOPMOST=-1, SWP_NOACTIVATE|SWP_SHOWWINDOW
             W.user32.SetWindowPos(self.overlay, ctypes.c_void_p(-1), vx, vy, vw, vh, 0x10 | 0x40)
         elif c == CMD_HIDE:
+            if gen != self._gen:                      # a newer capture started since: it wants the overlay
+                return
             W.user32.ShowWindow(self.overlay, 0)
+            # The cursor image is only re-evaluated when the pointer moves; re-assert the position so
+            # it cannot stay blank after the overlay is gone.
+            self.move_abs(*self.cursor_pos())
 
     # ------------------------------------------------- Platform interface
     def cursor_pos(self) -> Tuple[int, int]:
@@ -171,19 +263,25 @@ class WinPlatform:
         W.user32.GetCursorPos(ctypes.byref(p))
         return p.x, p.y
 
+    def _inj(self, delta: int):
+        with self._inj_lock:
+            self.injecting += delta
+
     def move_abs(self, x: int, y: int):
-        self.injecting += 1
+        x, y = int(x), int(y)
+        self._last_inj = (x, y, time.monotonic())
+        self._inj(1)
         try:
-            W.user32.SetCursorPos(int(x), int(y))
+            W.user32.SetCursorPos(x, y)
         finally:
-            self.injecting -= 1
+            self._inj(-1)
 
     def _send(self, inp: "W.INPUT"):
-        self.injecting += 1
+        self._inj(1)
         try:
             W.user32.SendInput(1, ctypes.byref(inp), ctypes.sizeof(W.INPUT))
         finally:
-            self.injecting -= 1
+            self._inj(-1)
 
     def _mouse(self, flags: int, data: int = 0):
         i = W.INPUT(type=W.INPUT_MOUSE)
@@ -213,17 +311,28 @@ class WinPlatform:
         self._send(i)
 
     def begin_capture(self) -> Tuple[int, int]:
-        """Pointer left this machine: park it mid-screen and hide it."""
+        """Pointer left this machine: hide the cursor, then park it mid-screen."""
         m = self.primary().rect
-        park = (m.x + m.w // 2, m.y + m.h // 2)
-        self.move_abs(*park)
-        if self.icfg.get("hide_cursor", True) and self.hwnd:
-            W.user32.PostMessageW(self.hwnd, W.WM_APP, CMD_SHOW, 0)
-        return park
+        self._center = (m.x + m.w // 2, m.y + m.h // 2)
+        self._park = self._center
+        self._gen += 1
+        gen = self._gen
+        if self._thread is not None and threading.get_ident() == self._thread.ident:
+            self._capture_now(gen)                   # called from the hook itself: do it synchronously
+        elif self.hwnd:
+            self._capture_pending = True             # network thread: the input thread does it, in order
+            W.user32.PostMessageW(self.hwnd, W.WM_APP, CMD_PARK, gen)
+        return self._park
+
+    def capture_ready(self) -> bool:
+        return not self._capture_pending
 
     def end_capture(self):
+        self._gen += 1                               # invalidates any queued park / re-centre
+        self._capture_pending = False
+        self._capturing = False
         if self.hwnd:
-            W.user32.PostMessageW(self.hwnd, W.WM_APP, CMD_HIDE, 0)
+            W.user32.PostMessageW(self.hwnd, W.WM_APP, CMD_HIDE, self._gen)
 
     def recenter(self, park: Tuple[int, int]):
         if self.cursor_pos() != park:

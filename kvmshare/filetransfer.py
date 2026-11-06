@@ -18,7 +18,9 @@ import hashlib
 import logging
 import os
 import re
+import json
 import secrets
+import shutil
 import stat
 import time
 from dataclasses import dataclass, field
@@ -30,6 +32,8 @@ from . import protocol as P
 log = logging.getLogger("kvmshare.files")
 
 CHUNK = 256 * 1024
+MARKER = ".kvmshare-batch"          # only folders we created carry this; cleanup never touches anything else
+_BATCH_RE = re.compile(r"^\d{8}-\d{6}-[0-9a-f]{6}$")
 _BAD_CHARS = re.compile(r'[<>:"|?*\\\x00-\x1f]')
 _RESERVED = {"con", "prn", "aux", "nul", *(f"com{i}" for i in range(1, 10)), *(f"lpt{i}" for i in range(1, 10))}
 
@@ -317,6 +321,20 @@ class FileService:
         return [j.view() for j in self.jobs.values()]
 
     async def _run(self, job: Job):
+        try:
+            await self._run_inner(job)
+        finally:
+            self._mark(job)
+
+    def _mark(self, job: Job):
+        if not job.dest:
+            return
+        try:
+            Path(job.dest, MARKER).write_text(json.dumps({"t": time.time(), "state": job.state}))
+        except OSError:
+            pass
+
+    async def _run_inner(self, job: Job):
         job.state, job.started = "running", time.time()
         delay = 1.0
         for attempt in range(1, int(self.fcfg["retries"]) + 2):
@@ -365,6 +383,7 @@ class FileService:
                 root = Path(self.fcfg["inbox"]) / f"{time.strftime('%Y%m%d-%H%M%S')}-{job.id[:6]}"
                 root.mkdir(parents=True, exist_ok=False)
                 job.dest = str(root)
+                self._mark(job)
             root = Path(job.dest)
             for e in job.entries:                              # create directories first (safe paths only)
                 if e["kind"] == "dir":
@@ -477,3 +496,69 @@ class FileService:
         if os.path.commonpath([str(root.resolve()), str(p)]) != str(root.resolve()):
             raise TransferError("path escapes destination")
         return p
+
+
+    # ============================================================ cleanup
+    def start_cleanup(self):
+        asyncio.ensure_future(self._cleanup_loop())
+
+    async def _cleanup_loop(self):
+        await asyncio.sleep(30)
+        loop = asyncio.get_running_loop()
+        while True:
+            try:
+                await loop.run_in_executor(None, self.cleanup_once)
+            except Exception:                                   # noqa: BLE001
+                log.exception("inbox cleanup failed")
+            await asyncio.sleep(300)
+
+    def cleanup_once(self, now: Optional[float] = None) -> List[str]:
+        """Delete received batches older than files.cleanup_minutes. Skips batches that are still
+        transferring, that the local clipboard still points at (paste may be pending), that lack our
+        marker, or that are not plain directories directly inside the inbox."""
+        minutes = float(self.fcfg.get("cleanup_minutes", 0))
+        inbox = Path(self.fcfg["inbox"])
+        if minutes <= 0 or not inbox.is_dir():
+            return []
+        now = now if now is not None else time.time()
+        active = {str(Path(j.dest).resolve()) for j in self.jobs.values()
+                  if j.dest and j.state in ("pending", "running")}
+        due = []
+        for d in inbox.iterdir():
+            try:
+                if d.is_symlink() or not d.is_dir() or not _BATCH_RE.match(d.name):
+                    continue
+                marker = d / MARKER
+                if not marker.is_file():
+                    continue
+                t = float(json.loads(marker.read_text()).get("t", 0))
+                if now - t < minutes * 60 or str(d.resolve()) in active:
+                    continue
+                due.append(d)
+            except (OSError, ValueError, TypeError):
+                continue
+        if not due:
+            return []
+        on_clipboard: List[str] = []
+        if self.clip is not None:
+            try:
+                snap = self.clip.read()
+                on_clipboard = [os.path.normcase(os.path.abspath(p)) for p in (snap.files if snap else [])]
+            except Exception:                                   # noqa: BLE001
+                return []                                       # cannot tell: keep everything this round
+        removed = []
+        for d in due:
+            prefix = os.path.normcase(os.path.abspath(str(d)))
+            if any(p == prefix or p.startswith(prefix + os.sep) for p in on_clipboard):
+                continue                                        # user may still be about to paste these
+
+            def _unlock(func, path, exc):                       # read-only files are preserved on receive
+                os.chmod(path, stat.S_IWRITE)
+                func(path)
+            shutil.rmtree(d, onerror=_unlock)
+            removed.append(str(d))
+            for j in self.jobs.values():
+                if j.dest and Path(j.dest) == d:
+                    j.state, j.error = "expired", "cleaned up after the retention period"
+            log.info("inbox cleanup removed %s", d.name)
+        return removed

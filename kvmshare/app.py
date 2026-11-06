@@ -83,6 +83,10 @@ class Daemon:
         return p.read_text().strip()
 
     async def run(self):
+        from . import perf, notifier
+        notifier.configure(self.cfg.get("notifications") or {})
+        perf.boost()
+        perf.boost_thread(2)                       # network/event-loop thread
         loop = asyncio.get_running_loop()
         cfg = self.cfg
         if sys.platform == "win32":
@@ -100,6 +104,7 @@ class Daemon:
         self.router.pos = self.platform.cursor_pos()
         self.link = PeerLink(cfg, self.ident, self.store, self.router, self.metrics, self.outbox, self.platform.monitors)
         self.files = FileService(cfg, self.link, notify, self.metrics, self.clipbe)
+        self.files.start_cleanup()
         self.clip = ClipboardSync(cfg, self.clipbe, self.link, self.files, notify, self.metrics, self.ident.device_id)
         self.router.on_clip_hotkey = lambda: loop.call_soon_threadsafe(self.clip.set_paused, not self.clip.paused)
         self.router.on_split_hotkey = lambda: loop.call_soon_threadsafe(self.toggle_split)
